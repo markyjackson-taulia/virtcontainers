@@ -50,6 +50,7 @@ var (
 	devPath                     = "/dev"
 	vsockSocketScheme           = "vsock"
 	kataBlkDevType              = "blk"
+	kataSCSIDevType             = "scsi"
 )
 
 // KataAgentConfig is a structure storing information needed
@@ -577,6 +578,31 @@ func constraintGRPCSpec(grpcSpec *grpc.Spec) {
 	}
 }
 
+func (k *kataAgent) appendDevices(deviceList []*grpc.Device, devices []Device) []*grpc.Device {
+	for _, device := range devices {
+		d, ok := device.(*BlockDevice)
+		if !ok {
+			continue
+		}
+
+		kataDevice := &grpc.Device{
+			ContainerPath: d.DeviceInfo.ContainerPath,
+		}
+
+		if d.SCSIAddr == "" {
+			kataDevice.Type = kataBlkDevType
+			kataDevice.VmPath = d.VirtPath
+		} else {
+			kataDevice.Type = kataSCSIDevType
+			kataDevice.Id = d.SCSIAddr
+		}
+
+		deviceList = append(deviceList, kataDevice)
+	}
+
+	return deviceList
+}
+
 func (k *kataAgent) createContainer(pod *Pod, c *Container) (*Process, error) {
 	ociSpecJSON, ok := c.config.Annotations[vcAnnotations.ConfigJSONKey]
 	if !ok {
@@ -599,12 +625,6 @@ func (k *kataAgent) createContainer(pod *Pod, c *Container) (*Process, error) {
 
 	if c.state.Fstype != "" {
 		// This is a block based device rootfs.
-		// driveName is the predicted virtio-block guest name (the vd* in /dev/vd*).
-		driveName, err := getVirtDriveName(c.state.BlockIndex)
-		if err != nil {
-			return nil, err
-		}
-		virtPath := filepath.Join(devPath, driveName)
 
 		// Create a new device with empty ContainerPath so that we get
 		// the device being waited for by the agent inside the VM,
@@ -612,14 +632,39 @@ func (k *kataAgent) createContainer(pod *Pod, c *Container) (*Process, error) {
 		// of actual devices. The device corresponding to the rootfs is
 		// a very specific case.
 		rootfsDevice := &grpc.Device{
-			Type:          kataBlkDevType,
-			VmPath:        virtPath,
 			ContainerPath: "",
+		}
+
+		// Pass a drive name only in case of virtio-blk driver.
+		// If virtio-scsi driver, the agent will be able to find the
+		// device based on the provided address.
+		if pod.config.HypervisorConfig.BlockDeviceDriver == VirtioBlock {
+			// driveName is the predicted virtio-block guest name (the vd* in /dev/vd*).
+			driveName, err := getVirtDriveName(c.state.BlockIndex)
+			if err != nil {
+				return nil, err
+			}
+			virtPath := filepath.Join(devPath, driveName)
+
+			rootfsDevice.Type = kataBlkDevType
+			rootfsDevice.VmPath = virtPath
+
+			rootfs.Source = virtPath
+		} else {
+			scsiAddr, err := getSCSIAddress(c.state.BlockIndex)
+			if err != nil {
+				return nil, err
+			}
+
+			rootfsDevice.Type = kataSCSIDevType
+			rootfsDevice.Id = scsiAddr
+
+			// This is meant to be updated by the agent.
+			rootfs.Source = ""
 		}
 
 		ctrDevices = append(ctrDevices, rootfsDevice)
 
-		rootfs.Source = virtPath
 		rootfs.MountPoint = rootPathParent
 		rootfs.Fstype = c.state.Fstype
 
@@ -679,21 +724,7 @@ func (k *kataAgent) createContainer(pod *Pod, c *Container) (*Process, error) {
 	constraintGRPCSpec(grpcSpec)
 
 	// Append container mounts for block devices passed with --device.
-	for _, device := range c.devices {
-		d, ok := device.(*BlockDevice)
-
-		if !ok {
-			continue
-		}
-
-		kataDevice := &grpc.Device{
-			Type:          kataBlkDevType,
-			VmPath:        d.VirtPath,
-			ContainerPath: d.DeviceInfo.ContainerPath,
-		}
-
-		ctrDevices = append(ctrDevices, kataDevice)
-	}
+	ctrDevices = k.appendDevices(ctrDevices, c.devices)
 
 	req := &grpc.CreateContainerRequest{
 		ContainerId: c.id,
